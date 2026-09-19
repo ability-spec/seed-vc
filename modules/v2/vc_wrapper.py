@@ -3,6 +3,7 @@ import librosa
 import torchaudio
 import numpy as np
 from pydub import AudioSegment
+import os
 from hf_utils import load_custom_model_from_hf
 
 DEFAULT_REPO_ID = "Plachta/Seed-VC"
@@ -51,6 +52,10 @@ class VoiceConversionWrapper(torch.nn.Module):
         self.dit_max_context_len = 30  # in seconds
         self.ar_max_content_len = 1500  # in num of narrow tokens
         self.compile_len = 87 * self.dit_max_context_len
+        # Target/reference feature cache (in-process). Keyed by target path,
+        # mtime/size, and the deterministic knobs that affect target-side
+        # preprocessing. Cleared automatically whenever any of those change.
+        self._target_cache = {}
 
     def forward_cfm(self, content_indices_wide, content_lens, mels, mel_lens, style_vectors):
         device = content_indices_wide.device
@@ -546,35 +551,83 @@ class VoiceConversionWrapper(torch.nn.Module):
         source_wave_16k_tensor = torch.tensor(source_wave_16k).unsqueeze(0).to(device)
         target_wave_16k_tensor = torch.tensor(target_wave_16k).unsqueeze(0).to(device)
 
-        # Compute mel spectrograms
+        # Compute mel spectrograms (source is always per-call; target mel is
+        # cached alongside the rest of the target features below).
         source_mel = self.mel_fn(source_wave_tensor)
-        target_mel = self.mel_fn(target_wave_tensor)
         source_mel_len = source_mel.size(2)
-        target_mel_len = target_mel.size(2)
-        
+
         # Set up chunk processing parameters
         max_context_window = self.sr // self.hop_size * self.dit_max_context_len
         overlap_wave_len = self.overlap_frame_len * self.hop_size
-        
-        with torch.autocast(device_type=device.type, dtype=dtype):
-            # Compute content features
-            source_content_indices = self._process_content_features(source_wave_16k_tensor, is_narrow=False)
-            target_content_indices = self._process_content_features(target_wave_16k_tensor, is_narrow=False)
-            # Compute style features
-            target_style = self.compute_style(target_wave_16k_tensor)
-            prompt_condition, _, = self.cfm_length_regulator(target_content_indices,
-                                                             ylens=torch.LongTensor([target_mel_len]).to(device))
 
+        # --- Target/reference feature cache (deterministic, per-worker) ---
+        # Cache only the target-side tensors; source tensors differ per call.
+        # The key fingerprints the reference audio file (path + mtime + size)
+        # plus every knob that changes target preprocessing. On a hit we skip
+        # target mel, wide-content, style, cfm-length-regulation, and (when
+        # convert_style=True) target narrow + duration reduction.
+        try:
+            _tgt_st = os.stat(target_audio_path)
+            _tgt_fp = (target_audio_path, _tgt_st.st_mtime_ns, _tgt_st.st_size)
+        except OSError:
+            _tgt_fp = (target_audio_path, None, None)
+        _cache_key = (
+            _tgt_fp,
+            self.sr, self.hop_size, self.dit_max_context_len,
+            device.type, str(dtype),
+            convert_style, anonymization_only,
+        )
+        if _cache_key in self._target_cache:
+            _cached = self._target_cache[_cache_key]
+            target_mel = _cached["target_mel"]
+            target_mel_len = _cached["target_mel_len"]
+            target_wave_16k_tensor = _cached["target_wave_16k_tensor"]
+            target_content_indices = _cached["target_content_indices"]
+            target_style = _cached["target_style"]
+            prompt_condition = _cached["prompt_condition"]
+            target_narrow_indices = _cached["target_narrow_indices"]
+            tgt_narrow_reduced = _cached["tgt_narrow_reduced"]
+            tgt_narrow_len = _cached["tgt_narrow_len"]
+        else:
+            target_mel = self.mel_fn(target_wave_tensor)
+            target_mel_len = target_mel.size(2)
+            with torch.autocast(device_type=device.type, dtype=dtype):
+                target_content_indices = self._process_content_features(target_wave_16k_tensor, is_narrow=False)
+                target_style = self.compute_style(target_wave_16k_tensor)
+                prompt_condition, _, = self.cfm_length_regulator(
+                    target_content_indices,
+                    ylens=torch.LongTensor([target_mel_len]).to(device))
+                target_narrow_indices = None
+                tgt_narrow_reduced = None
+                tgt_narrow_len = None
+                if convert_style:
+                    target_narrow_indices = self._process_content_features(target_wave_16k_tensor, is_narrow=True)
+                    tgt_narrow_reduced, tgt_narrow_len = self.duration_reduction_func(target_narrow_indices[0], 1)
+            self._target_cache[_cache_key] = {
+                "target_mel": target_mel,
+                "target_mel_len": target_mel_len,
+                "target_wave_16k_tensor": target_wave_16k_tensor,
+                "target_content_indices": target_content_indices,
+                "target_style": target_style,
+                "prompt_condition": prompt_condition,
+                "target_narrow_indices": target_narrow_indices,
+                "tgt_narrow_reduced": tgt_narrow_reduced,
+                "tgt_narrow_len": tgt_narrow_len,
+            }
+
+        with torch.autocast(device_type=device.type, dtype=dtype):
+            # Compute SOURCE content features (always per-source, never cached).
+            source_content_indices = self._process_content_features(source_wave_16k_tensor, is_narrow=False)
         # prepare for streaming
         generated_wave_chunks = []
         processed_frames = 0
         previous_chunk = None
         if convert_style:
             with torch.autocast(device_type=device.type, dtype=dtype):
+                # Source narrow features are per-source; target narrow were
+                # computed (or served from cache) above.
                 source_narrow_indices = self._process_content_features(source_wave_16k_tensor, is_narrow=True)
-                target_narrow_indices = self._process_content_features(target_wave_16k_tensor, is_narrow=True)
             src_narrow_reduced, src_narrow_len = self.duration_reduction_func(source_narrow_indices[0], 1)
-            tgt_narrow_reduced, tgt_narrow_len = self.duration_reduction_func(target_narrow_indices[0], 1)
             # Process src_narrow_reduced in chunks of max 1000 tokens
             max_chunk_size = self.ar_max_content_len - tgt_narrow_len
 
