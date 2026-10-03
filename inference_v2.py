@@ -8,7 +8,7 @@ import yaml
 import soundfile as sf
 import time
 from pathlib import Path
-from modules.commons import str2bool
+from inference_cli import str2bool, audio_identity
 
 # Set up device and torch configurations
 if torch.cuda.is_available():
@@ -91,8 +91,8 @@ def _save_one(source_audio_path, target_audio_path, output_dir, args):
     converted_audio = convert_voice_v2(source_audio_path, target_audio_path, args)
     if converted_audio is None:
         return None
-    source_name = os.path.basename(source_audio_path).split(".")[0]
-    target_name = os.path.basename(target_audio_path).split(".")[0]
+    source_name = audio_identity(source_audio_path)
+    target_name = audio_identity(target_audio_path)
     filename = f"vc_v2_{source_name}_{target_name}_{args.length_adjust}_{args.diffusion_steps}_{args.similarity_cfg_rate}.wav"
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, filename)
@@ -156,8 +156,8 @@ def main(args):
         return 1
 
     # Save the converted audio
-    source_name = os.path.basename(args.source).split(".")[0]
-    target_name = os.path.basename(args.target).split(".")[0]
+    source_name = audio_identity(args.source)
+    target_name = audio_identity(args.target)
 
     # Create a descriptive filename
     filename = f"vc_v2_{source_name}_{target_name}_{args.length_adjust}_{args.diffusion_steps}_{args.similarity_cfg_rate}.wav"
@@ -185,7 +185,7 @@ if __name__ == "__main__":
                         help="Number of diffusion steps")
     parser.add_argument("--length-adjust", type=float, default=1.0,
                         help="Length adjustment factor (<1.0 for speed-up, >1.0 for slow-down)")
-    parser.add_argument("--compile", type=bool, default=False,
+    parser.add_argument("--compile", type=str2bool, default=False,
                         help="Whether to compile the model for faster inference")
 
     # V2 specific arguments
@@ -214,3 +214,4 @@ if __name__ == "__main__":
     if args.source is None and args.source_list is None:
         parser.error("one of --source or --source-list is required")
     sys.exit(main(args))
+
